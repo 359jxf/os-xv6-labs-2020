@@ -121,6 +121,16 @@ found:
     return 0;
   }
 
+  // Init the kernal page table
+  p->kernelpt = proc_kpt_init();
+
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK(0);
+  uvmmap(p->kernelpt, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -142,6 +152,12 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  // free the kernel stack in the RAM
+  uvmunmap(p->kernelpt, p->kstack, 1, 1);
+  p->kstack = 0;
+  proc_freekernelpt(p->kernelpt);
+  p->kernelpt=0;
+  
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -151,6 +167,7 @@ freeproc(struct proc *p)
   p->xstate = 0;
   p->state = UNUSED;
 }
+
 
 // Create a user page table for a given process,
 // with no user memory, but with trampoline pages.
@@ -221,6 +238,9 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  // 复制一份到内核页表
+  u2k_vmcopy(p->pagetable, p->kernelpt, 0, p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -243,11 +263,19 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    // 加上PLIC限制
+    if(PGROUNDUP(sz+n) >= PLIC){
+      return -1;
+    }
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    // 复制一份到内核页表
+    u2k_vmcopy(p->pagetable, p->kernelpt, sz - n, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    // 解除内核页表中对应部分的映射
+    // uvmunmap(p->kernelpt, sz, -n, 0);
   }
   p->sz = sz;
   return 0;
@@ -274,7 +302,8 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
-
+  // 复制到新进程的内核页表
+  u2k_vmcopy(np->pagetable, np->kernelpt, 0, np->sz);
   np->parent = p;
 
   // copy saved user registers.
@@ -290,9 +319,6 @@ fork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
-
-  //将mask拷贝到子进程
-  np->mask = p->mask;
 
   pid = np->pid;
 
@@ -476,7 +502,14 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // Store the kernal page table into the SATP
+        proc_inithart(p->kernelpt);
+
         swtch(&c->context, &p->context);
+
+        // Come back to the global kernel page table
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
@@ -486,10 +519,14 @@ scheduler(void)
       }
       release(&p->lock);
     }
+#if !defined (LAB_FS)
     if(found == 0) {
       intr_on();
       asm volatile("wfi");
     }
+#else
+    ;
+#endif
   }
 }
 
@@ -694,16 +731,5 @@ procdump(void)
       state = "???";
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
-  }
-}
-
-void
-procnum(uint64 *dst)
-{
-  *dst = 0;
-  struct proc *p;
-  for (p = proc; p < &proc[NPROC]; p++) {
-    if (p->state != UNUSED)
-      (*dst)++;
   }
 }
