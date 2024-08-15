@@ -324,43 +324,6 @@ uint64 sys_open(void)
         }
     }
 
-    if (!(omode & O_NOFOLLOW) && ip->type == T_SYMLINK) {
-        // 软链接的判断条件为：
-        // 1. 文件类型是SYMLINK
-        // 2. 非O_NOFOLLOW
-        // 而且最终定位到的文件不应是软链接类型，要设置递归深度，若超过该深度则返回错误
-        char path[MAXPATH];
-        for (int i = 0; i < SYMLINK_REC_MAX; i++) {
-            // 递归深度为SYMLINK_REC_MAX（定义于fs.h）
-
-            if (readi(ip, 0, (uint64)path, 0, MAXPATH) < MAXPATH) {
-                // 读取软链接所存储的目标路径
-                iunlockput(ip);
-                end_op();
-                return -1;
-            }
-
-            iunlockput(ip);
-            // namei计算path并返回相应的inode
-            if ((ip = namei(path)) == 0) {
-                end_op();
-                return -1;
-            }
-            ilock(ip);
-
-            if (ip->type != T_SYMLINK)
-                // 找到不是软链接类型的文件inode，继续正常打开
-                break;
-        }
-
-        if (ip->type >= T_SYMLINK) {
-            // 若超出递归深度，返回-1
-            iunlockput(ip);
-            end_op();
-            return -1;
-        }
-    }
-
     if (ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)) {
         iunlockput(ip);
         end_op();
@@ -524,32 +487,95 @@ uint64 sys_pipe(void)
     return 0;
 }
 
-uint64 sys_symlink(void)
+uint64 sys_mmap(void)
 {
-    char target[MAXPATH];
-    char path[MAXPATH];
-    argstr(0, target, MAXPATH);
-    argstr(1, path, MAXPATH);
+    int length, prot, flags, fd, offset;
+    uint64 addr;
+    struct file *fp;
 
-    // begin_op一直保持等待直到日志系统当前未处于提交中
-    // 并且直到有足够的未被占用的日志空间来保存此调用的写入
-    begin_op();
+    struct proc *p = myproc();
+    // 传入参数处理
+    argaddr(0, &addr);
+    argint(1, &length);
+    argint(2, &prot);
+    argint(3, &flags);
+    argfd(4, &fd, &fp);
+    argint(5, &offset);
 
-    struct inode *ip = create(path, T_SYMLINK, 0, 0); // 根据给定的符号虚拟地址创建一个inode
-
-    if (ip == 0) {
-        end_op();
+    // 参数检查
+    if (!(fp->writable) && (prot & PROT_WRITE) && (flags == MAP_SHARED)) {
+        // 权限冲突，无法写入
         return -1;
     }
 
-    if (writei(ip, 0, (uint64)target, 0, MAXPATH) < MAXPATH) {
-        // 将目标地址存放在inode中，以实现软链接
-        iunlockput(ip);
-        end_op();
+    length = PGROUNDUP(length);
+    if (p->sz + length > MAXVA) {
         return -1;
     }
 
-    iunlockput(ip); // 释放inode
-    end_op();       // 结束日志系统
-    return 0;
+    for (int i = 0; i < VMASIZE; i++) {
+        if (p->vma[i].active == 0) {
+            // 标记为占用
+            p->vma[i].active = 1;
+
+            // 直接映射到p->sz虚拟地址
+            p->vma[i].addr = p->sz;
+            p->vma[i].length = length;
+            p->vma[i].prot = prot;
+            p->vma[i].flags = flags;
+            p->vma[i].fd = fd;
+            p->vma[i].fp = fp;
+            p->vma[i].offset = offset;
+
+            // 文件引用计数增加
+            filedup(fp);
+
+            // 更新进程的大小基址
+            p->sz += length;
+
+            // 返回值应当是映射的虚拟地址
+            return p->vma[i].addr;
+        }
+    }
+    return -1;
+}
+
+uint64 sys_munmap(void)
+{
+    int length;
+    uint64 addr;
+    argaddr(0, &addr);
+    argint(1, &length);
+
+    struct proc *p = myproc();
+    struct VMA *vma = 0;
+    for (int i = 0; i < VMASIZE; i++) {
+        // 找到对应的VMA
+        if (p->vma[i].active) {
+            if (addr == p->vma[i].addr) {
+                // 因为addr和length是页对齐的，所以只要addr相等，就一定是同一个VMA
+                vma = &p->vma[i];
+                break;
+            }
+        }
+    }
+
+    if (vma == 0) {
+        return 0;
+    }
+    else {
+        vma->addr += length;
+        vma->length -= length;
+        if (vma->flags & MAP_SHARED)
+            // 如果是共享映射，需要把文件内容写回
+            filewrite(vma->fp, addr, length);
+
+        uvmunmap(p->pagetable, addr, length / PGSIZE, 1);
+        if (vma->length == 0) {
+            // 如果VMA的长度为0，说明已经全部解除映射，需要释放资源
+            fileclose(vma->fp);
+            vma->active = 0;
+        }
+        return 0;
+    }
 }
