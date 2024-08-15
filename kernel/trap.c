@@ -6,11 +6,9 @@
 #include "proc.h"
 #include "defs.h"
 #include "fcntl.h"
-#include "stat.h"
-#include "fs.h"
 #include "sleeplock.h"
+#include "fs.h"
 #include "file.h"
-
 struct spinlock tickslock;
 uint ticks;
 
@@ -21,205 +19,204 @@ void kernelvec();
 
 extern int devintr();
 
-void trapinit(void)
+void
+trapinit(void)
 {
-    initlock(&tickslock, "time");
+  initlock(&tickslock, "time");
 }
 
 // set up to take exceptions and traps while in the kernel.
-void trapinithart(void)
+void
+trapinithart(void)
 {
-    w_stvec((uint64)kernelvec);
+  w_stvec((uint64)kernelvec);
 }
 
 //
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
 //
-void usertrap(void)
+void
+usertrap(void)
 {
-    int which_dev = 0;
+  int which_dev = 0;
 
-    if ((r_sstatus() & SSTATUS_SPP) != 0)
-        panic("usertrap: not from user mode");
+  if((r_sstatus() & SSTATUS_SPP) != 0)
+    panic("usertrap: not from user mode");
 
-    // send interrupts and exceptions to kerneltrap(),
-    // since we're now in the kernel.
-    w_stvec((uint64)kernelvec);
+  // send interrupts and exceptions to kerneltrap(),
+  // since we're now in the kernel.
+  w_stvec((uint64)kernelvec);
 
-    struct proc *p = myproc();
+  struct proc *p = myproc();
+  
+  // save user program counter.
+  p->trapframe->epc = r_sepc();
+  
+  if(r_scause() == 8){
+    // system call
 
-    // save user program counter.
-    p->trapframe->epc = r_sepc();
+    if(p->killed)
+      exit(-1);
 
-    if (r_scause() == 8) {
-        // system call
+    // sepc points to the ecall instruction,
+    // but we want to return to the next instruction.
+    p->trapframe->epc += 4;
 
-        if (killed(p))
-            exit(-1);
+    // an interrupt will change sstatus &c registers,
+    // so don't enable until done with those registers.
+    intr_on();
 
-        // sepc points to the ecall instruction,
-        // but we want to return to the next instruction.
-        p->trapframe->epc += 4;
-
-        // an interrupt will change sepc, scause, and sstatus,
-        // so enable only now that we're done with those registers.
-        intr_on();
-
-        syscall();
+    syscall();
+  } else if((which_dev = devintr()) != 0){
+    // ok
+  } else if( r_scause() == 13 || r_scause() == 15 ){
+    uint64 va = r_stval();
+    // 判断虚拟地址合法性，非法直接杀死进程
+    // 注意进程堆栈从高向低生长，因此判定是否重合，应把va向上取，堆栈指针向下取
+    if(va >= p->sz || va > MAXVA || PGROUNDUP(va) == PGROUNDDOWN(p->trapframe->sp)) {
+      p->killed = 1;
     }
-    else if ((which_dev = devintr()) != 0) {
-        // ok
+    // 读取进程中该内存地址对应的vma 
+    struct vma *vma = 0;
+    for (int i = 0; i < VMASIZE; i++) {
+      if (p->vma[i].valid == 1 && va >= p->vma[i].addr && va < p->vma[i].addr + p->vma[i].length) {
+        vma = &p->vma[i];
+        break;
+      }
     }
-    else if (r_scause() == 13 || r_scause() == 15) {
-        // 缺页异常
-        uint64 va = r_stval(); // 获取缺页地址
-        if (va > MAXVA || va >= p->sz) {
-            // 越界
-            p->killed = 1;
+    // 分配内存空间，将对应物理地址数据读入
+    if(vma) {
+      va = PGROUNDDOWN(va);
+      uint64 offset = va - vma->addr;
+      uint64 mem = (uint64)kalloc();
+      
+      if(mem == 0) {
+        p->killed = 1;
+      } else {
+        memset((void*)mem, 0, PGSIZE);
+        // 读取数据
+        ilock(vma->f->ip);
+        readi(vma->f->ip, 0, mem, offset, PGSIZE);
+        iunlock(vma->f->ip);
+        // 设置标志位
+        int flag = PTE_U;
+        if(vma->prot & PROT_READ){
+          flag |= PTE_R;
         }
-        else {
-            struct VMA *pvma = 0;
-            for (int i = 0; i < VMASIZE; i++) {
-                // 找到对应的VMA
-                if (p->vma[i].active == 0)
-                    continue;
-                if (va >= p->vma[i].addr && va < p->vma[i].addr + p->vma[i].length) {
-                    pvma = &p->vma[i];
-                }
-            }
-
-            if (pvma) {
-                // 若找到了对应的VMA，则要把对应的虚拟地址分配到物理地址，同时把文件内容读到物理地址
-                va = PGROUNDDOWN(va);
-                uint64 pa = (uint64)kalloc();
-                if (pa == 0) {
-                    // 分配失败
-                    p->killed = 1;
-                }
-                else {
-                    memset((void *)pa, 0, PGSIZE);
-                    ilock(pvma->fp->ip);                                 // 加锁
-                    readi(pvma->fp->ip, 0, pa, va - pvma->addr, PGSIZE); // 读取文件内容
-                    iunlock(pvma->fp->ip);                               // 解锁
-
-                    // 根据flag参数设置PTE
-                    int PTE_flags = PTE_U;
-                    if (pvma->prot & PROT_READ)
-                        PTE_flags |= PTE_R;
-                    if (pvma->prot & PROT_WRITE)
-                        PTE_flags |= PTE_W;
-                    if (pvma->prot & PROT_EXEC)
-                        PTE_flags |= PTE_X;
-
-                    // 映射
-                    printf("map start\n");
-                    if (mappages(p->pagetable, va, PGSIZE, pa, PTE_flags) != 0) {
-                        // 映射失败
-                        kfree((void *)pa);
-                        p->killed = 1;
-                    }
-                }
-            }
+        if(vma->prot & PROT_WRITE){
+          flag |= PTE_W;
         }
-    }
-    else {
-        printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
-        printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-        setkilled(p);
-    }
+        if(vma->prot & PROT_EXEC){
+          flag |= PTE_X;
+        }
+        // 建立页表映射(创建PTE)
+        if(mappages(p->pagetable, va, PGSIZE, mem, flag) != 0) {
+          kfree((void*)mem);
+          p->killed = 1;
+        }
+      }
+   }
+ }
+  else {
+    printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+    printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+    p->killed = 1;
+  }
 
-    if (killed(p))
-        exit(-1);
+  if(p->killed)
+    exit(-1);
 
-    // give up the CPU if this is a timer interrupt.
-    if (which_dev == 2)
-        yield();
+  // give up the CPU if this is a timer interrupt.
+  if(which_dev == 2)
+    yield();
 
-    usertrapret();
+  usertrapret();
 }
 
 //
 // return to user space
 //
-void usertrapret(void)
+void
+usertrapret(void)
 {
-    struct proc *p = myproc();
+  struct proc *p = myproc();
 
-    // we're about to switch the destination of traps from
-    // kerneltrap() to usertrap(), so turn off interrupts until
-    // we're back in user space, where usertrap() is correct.
-    intr_off();
+  // we're about to switch the destination of traps from
+  // kerneltrap() to usertrap(), so turn off interrupts until
+  // we're back in user space, where usertrap() is correct.
+  intr_off();
 
-    // send syscalls, interrupts, and exceptions to uservec in trampoline.S
-    uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
-    w_stvec(trampoline_uservec);
+  // send syscalls, interrupts, and exceptions to trampoline.S
+  w_stvec(TRAMPOLINE + (uservec - trampoline));
 
-    // set up trapframe values that uservec will need when
-    // the process next traps into the kernel.
-    p->trapframe->kernel_satp = r_satp();         // kernel page table
-    p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
-    p->trapframe->kernel_trap = (uint64)usertrap;
-    p->trapframe->kernel_hartid = r_tp(); // hartid for cpuid()
+  // set up trapframe values that uservec will need when
+  // the process next re-enters the kernel.
+  p->trapframe->kernel_satp = r_satp();         // kernel page table
+  p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
+  p->trapframe->kernel_trap = (uint64)usertrap;
+  p->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
 
-    // set up the registers that trampoline.S's sret will use
-    // to get to user space.
+  // set up the registers that trampoline.S's sret will use
+  // to get to user space.
+  
+  // set S Previous Privilege mode to User.
+  unsigned long x = r_sstatus();
+  x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
+  x |= SSTATUS_SPIE; // enable interrupts in user mode
+  w_sstatus(x);
 
-    // set S Previous Privilege mode to User.
-    unsigned long x = r_sstatus();
-    x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
-    x |= SSTATUS_SPIE; // enable interrupts in user mode
-    w_sstatus(x);
+  // set S Exception Program Counter to the saved user pc.
+  w_sepc(p->trapframe->epc);
 
-    // set S Exception Program Counter to the saved user pc.
-    w_sepc(p->trapframe->epc);
+  // tell trampoline.S the user page table to switch to.
+  uint64 satp = MAKE_SATP(p->pagetable);
 
-    // tell trampoline.S the user page table to switch to.
-    uint64 satp = MAKE_SATP(p->pagetable);
-
-    // jump to userret in trampoline.S at the top of memory, which
-    // switches to the user page table, restores user registers,
-    // and switches to user mode with sret.
-    uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
-    ((void (*)(uint64))trampoline_userret)(satp);
+  // jump to trampoline.S at the top of memory, which 
+  // switches to the user page table, restores user registers,
+  // and switches to user mode with sret.
+  uint64 fn = TRAMPOLINE + (userret - trampoline);
+  ((void (*)(uint64,uint64))fn)(TRAPFRAME, satp);
 }
 
 // interrupts and exceptions from kernel code go here via kernelvec,
 // on whatever the current kernel stack is.
-void kerneltrap()
+void 
+kerneltrap()
 {
-    int which_dev = 0;
-    uint64 sepc = r_sepc();
-    uint64 sstatus = r_sstatus();
-    uint64 scause = r_scause();
+  int which_dev = 0;
+  uint64 sepc = r_sepc();
+  uint64 sstatus = r_sstatus();
+  uint64 scause = r_scause();
+  
+  if((sstatus & SSTATUS_SPP) == 0)
+    panic("kerneltrap: not from supervisor mode");
+  if(intr_get() != 0)
+    panic("kerneltrap: interrupts enabled");
 
-    if ((sstatus & SSTATUS_SPP) == 0)
-        panic("kerneltrap: not from supervisor mode");
-    if (intr_get() != 0)
-        panic("kerneltrap: interrupts enabled");
+  if((which_dev = devintr()) == 0){
+    printf("scause %p\n", scause);
+    printf("sepc=%p stval=%p\n", r_sepc(), r_stval());
+    panic("kerneltrap");
+  }
 
-    if ((which_dev = devintr()) == 0) {
-        printf("scause %p\n", scause);
-        printf("sepc=%p stval=%p\n", r_sepc(), r_stval());
-        panic("kerneltrap");
-    }
+  // give up the CPU if this is a timer interrupt.
+  if(which_dev == 2 && myproc() != 0 && myproc()->state == RUNNING)
+    yield();
 
-    // give up the CPU if this is a timer interrupt.
-    if (which_dev == 2 && myproc() != 0 && myproc()->state == RUNNING)
-        yield();
-
-    // the yield() may have caused some traps to occur,
-    // so restore trap registers for use by kernelvec.S's sepc instruction.
-    w_sepc(sepc);
-    w_sstatus(sstatus);
+  // the yield() may have caused some traps to occur,
+  // so restore trap registers for use by kernelvec.S's sepc instruction.
+  w_sepc(sepc);
+  w_sstatus(sstatus);
 }
 
-void clockintr()
+void
+clockintr()
 {
-    acquire(&tickslock);
-    ticks++;
-    wakeup(&ticks);
-    release(&tickslock);
+  acquire(&tickslock);
+  ticks++;
+  wakeup(&ticks);
+  release(&tickslock);
 }
 
 // check if it's an external interrupt or software interrupt,
@@ -227,49 +224,48 @@ void clockintr()
 // returns 2 if timer interrupt,
 // 1 if other device,
 // 0 if not recognized.
-int devintr()
+int
+devintr()
 {
-    uint64 scause = r_scause();
+  uint64 scause = r_scause();
 
-    if ((scause & 0x8000000000000000L) && (scause & 0xff) == 9) {
-        // this is a supervisor external interrupt, via PLIC.
+  if((scause & 0x8000000000000000L) &&
+     (scause & 0xff) == 9){
+    // this is a supervisor external interrupt, via PLIC.
 
-        // irq indicates which device interrupted.
-        int irq = plic_claim();
+    // irq indicates which device interrupted.
+    int irq = plic_claim();
 
-        if (irq == UART0_IRQ) {
-            uartintr();
-        }
-        else if (irq == VIRTIO0_IRQ) {
-            virtio_disk_intr();
-        }
-        else if (irq) {
-            printf("unexpected interrupt irq=%d\n", irq);
-        }
-
-        // the PLIC allows each device to raise at most one
-        // interrupt at a time; tell the PLIC the device is
-        // now allowed to interrupt again.
-        if (irq)
-            plic_complete(irq);
-
-        return 1;
+    if(irq == UART0_IRQ){
+      uartintr();
+    } else if(irq == VIRTIO0_IRQ){
+      virtio_disk_intr();
+    } else if(irq){
+      printf("unexpected interrupt irq=%d\n", irq);
     }
-    else if (scause == 0x8000000000000001L) {
-        // software interrupt from a machine-mode timer interrupt,
-        // forwarded by timervec in kernelvec.S.
 
-        if (cpuid() == 0) {
-            clockintr();
-        }
+    // the PLIC allows each device to raise at most one
+    // interrupt at a time; tell the PLIC the device is
+    // now allowed to interrupt again.
+    if(irq)
+      plic_complete(irq);
 
-        // acknowledge the software interrupt by clearing
-        // the SSIP bit in sip.
-        w_sip(r_sip() & ~2);
+    return 1;
+  } else if(scause == 0x8000000000000001L){
+    // software interrupt from a machine-mode timer interrupt,
+    // forwarded by timervec in kernelvec.S.
 
-        return 2;
+    if(cpuid() == 0){
+      clockintr();
     }
-    else {
-        return 0;
-    }
+    
+    // acknowledge the software interrupt by clearing
+    // the SSIP bit in sip.
+    w_sip(r_sip() & ~2);
+
+    return 2;
+  } else {
+    return 0;
+  }
 }
+
