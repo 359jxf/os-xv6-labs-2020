@@ -4,6 +4,8 @@
 #include "elf.h"
 #include "riscv.h"
 #include "defs.h"
+#include "spinlock.h"
+#include "proc.h"
 #include "fs.h"
 
 /*
@@ -30,6 +32,14 @@ kvmmake(void)
   // virtio mmio disk interface
   kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
 
+#ifdef LAB_NET
+  // PCI-E ECAM (configuration space), for pci.c
+  kvmmap(kpgtbl, 0x30000000L, 0x30000000L, 0x10000000, PTE_R | PTE_W);
+
+  // pci.c maps the e1000's registers here.
+  kvmmap(kpgtbl, 0x40000000L, 0x40000000L, 0x20000, PTE_R | PTE_W);
+#endif  
+
   // PLIC
   kvmmap(kpgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
 
@@ -43,7 +53,7 @@ kvmmake(void)
   // the highest virtual address in the kernel.
   kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 
-  // map kernel stacks
+  // allocate and map a kernel stack for each process.
   proc_mapstacks(kpgtbl);
   
   return kpgtbl;
@@ -61,7 +71,12 @@ kvminit(void)
 void
 kvminithart()
 {
+  // wait for any previous writes to the page table memory to finish.
+  sfence_vma();
+
   w_satp(MAKE_SATP(kernel_pagetable));
+
+  // flush stale entries from the TLB.
   sfence_vma();
 }
 
@@ -174,9 +189,10 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0)
-      continue;
-      // panic("uvmunmap: not mapped");
+    if((*pte & PTE_V) == 0) {
+      printf("va=%p pte=%p\n", a, *pte);
+      panic("uvmunmap: not mapped");
+    }
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -204,12 +220,12 @@ uvmcreate()
 // for the very first process.
 // sz must be less than a page.
 void
-uvminit(pagetable_t pagetable, uchar *src, uint sz)
+uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
 {
   char *mem;
 
   if(sz >= PGSIZE)
-    panic("inituvm: more than a page");
+    panic("uvmfirst: more than a page");
   mem = kalloc();
   memset(mem, 0, PGSIZE);
   mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
@@ -219,7 +235,7 @@ uvminit(pagetable_t pagetable, uchar *src, uint sz)
 // Allocate PTEs and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
-uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 {
   char *mem;
   uint64 a;
@@ -235,7 +251,7 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
       return 0;
     }
     memset(mem, 0, PGSIZE);
-    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
       kfree(mem);
       uvmdealloc(pagetable, a, oldsz);
       return 0;
@@ -310,8 +326,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
-      continue;
-      //panic("uvmcopy: page not present");
+      panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -374,7 +389,7 @@ int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
   uint64 n, va0, pa0;
-
+  
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
@@ -434,3 +449,6 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     return -1;
   }
 }
+
+
+

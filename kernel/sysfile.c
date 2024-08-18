@@ -24,8 +24,7 @@ argfd(int n, int *pfd, struct file **pf)
   int fd;
   struct file *f;
 
-  if(argint(n, &fd) < 0)
-    return -1;
+  argint(n, &fd);
   if(fd < 0 || fd >= NOFILE || (f=myproc()->ofile[fd]) == 0)
     return -1;
   if(pfd)
@@ -73,7 +72,9 @@ sys_read(void)
   int n;
   uint64 p;
 
-  if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argaddr(1, &p) < 0)
+  argaddr(1, &p);
+  argint(2, &n);
+  if(argfd(0, 0, &f) < 0)
     return -1;
   return fileread(f, p, n);
 }
@@ -84,8 +85,10 @@ sys_write(void)
   struct file *f;
   int n;
   uint64 p;
-
-  if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argaddr(1, &p) < 0)
+  
+  argaddr(1, &p);
+  argint(2, &n);
+  if(argfd(0, 0, &f) < 0)
     return -1;
 
   return filewrite(f, p, n);
@@ -110,7 +113,8 @@ sys_fstat(void)
   struct file *f;
   uint64 st; // user pointer to struct stat
 
-  if(argfd(0, 0, &f) < 0 || argaddr(1, &st) < 0)
+  argaddr(1, &st);
+  if(argfd(0, 0, &f) < 0)
     return -1;
   return filestat(f, st);
 }
@@ -258,8 +262,10 @@ create(char *path, short type, short major, short minor)
     return 0;
   }
 
-  if((ip = ialloc(dp->dev, type)) == 0)
-    panic("create: ialloc");
+  if((ip = ialloc(dp->dev, type)) == 0){
+    iunlockput(dp);
+    return 0;
+  }
 
   ilock(ip);
   ip->major = major;
@@ -268,19 +274,31 @@ create(char *path, short type, short major, short minor)
   iupdate(ip);
 
   if(type == T_DIR){  // Create . and .. entries.
-    dp->nlink++;  // for ".."
-    iupdate(dp);
     // No ip->nlink++ for ".": avoid cyclic ref count.
     if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
-      panic("create dots");
+      goto fail;
   }
 
   if(dirlink(dp, name, ip->inum) < 0)
-    panic("create: dirlink");
+    goto fail;
+
+  if(type == T_DIR){
+    // now that success is guaranteed:
+    dp->nlink++;  // for ".."
+    iupdate(dp);
+  }
 
   iunlockput(dp);
 
   return ip;
+
+ fail:
+  // something went wrong. de-allocate ip.
+  ip->nlink = 0;
+  iupdate(ip);
+  iunlockput(ip);
+  iunlockput(dp);
+  return 0;
 }
 
 uint64
@@ -292,7 +310,8 @@ sys_open(void)
   struct inode *ip;
   int n;
 
-  if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
+  argint(1, &omode);
+  if((n = argstr(0, path, MAXPATH)) < 0)
     return -1;
 
   begin_op();
@@ -375,9 +394,9 @@ sys_mknod(void)
   int major, minor;
 
   begin_op();
+  argint(1, &major);
+  argint(2, &minor);
   if((argstr(0, path, MAXPATH)) < 0 ||
-     argint(1, &major) < 0 ||
-     argint(2, &minor) < 0 ||
      (ip = create(path, T_DEVICE, major, minor)) == 0){
     end_op();
     return -1;
@@ -419,7 +438,8 @@ sys_exec(void)
   int i;
   uint64 uargv, uarg;
 
-  if(argstr(0, path, MAXPATH) < 0 || argaddr(1, &uargv) < 0){
+  argaddr(1, &uargv);
+  if(argstr(0, path, MAXPATH) < 0) {
     return -1;
   }
   memset(argv, 0, sizeof(argv));
@@ -462,8 +482,7 @@ sys_pipe(void)
   int fd0, fd1;
   struct proc *p = myproc();
 
-  if(argaddr(0, &fdarray) < 0)
-    return -1;
+  argaddr(0, &fdarray);
   if(pipealloc(&rf, &wf) < 0)
     return -1;
   fd0 = -1;
@@ -485,86 +504,28 @@ sys_pipe(void)
   return 0;
 }
 
-// mmap
-uint64
-sys_mmap(void){
+
+#ifdef LAB_NET
+int
+sys_connect(void)
+{
   struct file *f;
-  int prot,flags,fd,offset; //文件相关参数
+  int fd;
+  uint32 raddr;
+  uint32 rport;
+  uint32 lport;
 
-  uint64 addr; // 相应内存部分起始地址
-  int length;  // 映射字节数
+  argint(0, (int*)&raddr);
+  argint(1, (int*)&lport);
+  argint(2, (int*)&rport);
 
-  if(argaddr(0, &addr) || argint(1, &length) || argint(2, &prot) ||
-    argint(3, &flags) || argfd(4, &fd, &f) || argint(5, &offset)) {
+  if(sockalloc(&f, raddr, lport, rport) < 0)
     return -1;
-  }
-  if(!(f->writable) && (prot & PROT_WRITE) && flags == MAP_SHARED){
-    // 若须写回 但写权限冲突
-    return -1;
-  }
-  struct proc *p=myproc();
-  length = PGROUNDUP(length); //使用堆高位地址，因为其是从低到高生长的
-  if(p->sz > MAXVA - length){
+  if((fd=fdalloc(f)) < 0){
+    fileclose(f);
     return -1;
   }
 
-  // 遍历vma数组，寻找未使用区域映射文件
-  for(int i = 0; i < VMASIZE; i++) {
-    if(p->vma[i].valid == 0) {
-      p->vma[i].valid = 1;
-      p->vma[i].addr = p->sz;
-      p->vma[i].length = length;
-      p->vma[i].f = f;
-      p->vma[i].prot = prot;
-      p->vma[i].flags = flags;
-      p->vma[i].fd = fd;
-      p->vma[i].offset = offset;
-      filedup(f); // 添加引用，不要忘记！！！
-      p->sz += length;
-      return p->vma[i].addr;
-    }
-  }
-  return -1;
+  return fd;
 }
-
-//munmap
-uint64
-sys_munmap(void){
-  uint64 addr;
-  int length;
-  if(argaddr(0, &addr) || argint(1, &length)){
-    return -1;
-  }
-  // 地址空间从低向高生长，优先使用了高位
-  addr = PGROUNDDOWN(addr); 
-  length = PGROUNDUP(length);
-  struct proc *p = myproc();
-  struct vma *vma = 0;
-  // 查找满足地址范围的vma
-  for(int i = 0; i < VMASIZE; i++) {
-    if (addr >= p->vma[i].addr || addr < p->vma[i].addr + p->vma[i].length) {
-      vma = &p->vma[i];
-      break;
-    }
-  }
-    // 若未找到则直接返回
-    if(vma == 0){
-      return 0;
-    } 
-    // 由实验要求，只需要取消地址与传入地址相同的文件的映射即可
-    if(vma->addr == addr) {
-      vma->addr += length; 
-      vma->length -= length;
-      // 若需要写回则先将脏页内容写回文件
-      if(vma->flags & MAP_SHARED){
-        filewrite(vma->f, addr, length);
-      }
-      // 取消页表映射
-      uvmunmap(p->pagetable, addr, length/PGSIZE, 1);
-      if(vma->length == 0) {
-        fileclose(vma->f);
-        vma->valid = 0;
-      }
-    }
-  return 0;
-}
+#endif

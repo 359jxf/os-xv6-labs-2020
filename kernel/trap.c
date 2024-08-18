@@ -5,10 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
-#include "fcntl.h"
-#include "sleeplock.h"
-#include "fs.h"
-#include "file.h"
+
 struct spinlock tickslock;
 uint ticks;
 
@@ -56,76 +53,31 @@ usertrap(void)
   if(r_scause() == 8){
     // system call
 
-    if(p->killed)
+    if(killed(p))
       exit(-1);
 
     // sepc points to the ecall instruction,
     // but we want to return to the next instruction.
     p->trapframe->epc += 4;
 
-    // an interrupt will change sstatus &c registers,
-    // so don't enable until done with those registers.
+    // an interrupt will change sepc, scause, and sstatus,
+    // so enable only now that we're done with those registers.
     intr_on();
 
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else if( r_scause() == 13 || r_scause() == 15 ){
-    uint64 va = r_stval();
-    // 判断虚拟地址合法性，非法直接杀死进程
-    // 注意进程堆栈从高向低生长，因此判定是否重合，应把va向上取，堆栈指针向下取
-    if(va >= p->sz || va > MAXVA || PGROUNDUP(va) == PGROUNDDOWN(p->trapframe->sp)) {
-      p->killed = 1;
-    }
-    // 读取进程中该内存地址对应的vma 
-    struct vma *vma = 0;
-    for (int i = 0; i < VMASIZE; i++) {
-      if (p->vma[i].valid == 1 && va >= p->vma[i].addr && va < p->vma[i].addr + p->vma[i].length) {
-        vma = &p->vma[i];
-        break;
-      }
-    }
-    // 分配内存空间，将对应物理地址数据读入
-    if(vma) {
-      va = PGROUNDDOWN(va);
-      uint64 offset = va - vma->addr;
-      uint64 mem = (uint64)kalloc();
-      
-      if(mem == 0) {
-        p->killed = 1;
-      } else {
-        memset((void*)mem, 0, PGSIZE);
-        // 读取数据
-        ilock(vma->f->ip);
-        readi(vma->f->ip, 0, mem, offset, PGSIZE);
-        iunlock(vma->f->ip);
-        // 设置标志位
-        int flag = PTE_U;
-        if(vma->prot & PROT_READ){
-          flag |= PTE_R;
-        }
-        if(vma->prot & PROT_WRITE){
-          flag |= PTE_W;
-        }
-        if(vma->prot & PROT_EXEC){
-          flag |= PTE_X;
-        }
-        // 建立页表映射(创建PTE)
-        if(mappages(p->pagetable, va, PGSIZE, mem, flag) != 0) {
-          kfree((void*)mem);
-          p->killed = 1;
-        }
-      }
-   }
- }
-  else {
+  } else {
+
+    
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-    p->killed = 1;
+    setkilled(p);
   }
 
-  if(p->killed)
+  if(killed(p))
     exit(-1);
+  
 
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
@@ -147,11 +99,12 @@ usertrapret(void)
   // we're back in user space, where usertrap() is correct.
   intr_off();
 
-  // send syscalls, interrupts, and exceptions to trampoline.S
-  w_stvec(TRAMPOLINE + (uservec - trampoline));
+  // send syscalls, interrupts, and exceptions to uservec in trampoline.S
+  uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
+  w_stvec(trampoline_uservec);
 
   // set up trapframe values that uservec will need when
-  // the process next re-enters the kernel.
+  // the process next traps into the kernel.
   p->trapframe->kernel_satp = r_satp();         // kernel page table
   p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
   p->trapframe->kernel_trap = (uint64)usertrap;
@@ -172,11 +125,11 @@ usertrapret(void)
   // tell trampoline.S the user page table to switch to.
   uint64 satp = MAKE_SATP(p->pagetable);
 
-  // jump to trampoline.S at the top of memory, which 
+  // jump to userret in trampoline.S at the top of memory, which 
   // switches to the user page table, restores user registers,
   // and switches to user mode with sret.
-  uint64 fn = TRAMPOLINE + (userret - trampoline);
-  ((void (*)(uint64,uint64))fn)(TRAPFRAME, satp);
+  uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
+  ((void (*)(uint64))trampoline_userret)(satp);
 }
 
 // interrupts and exceptions from kernel code go here via kernelvec,
@@ -240,7 +193,13 @@ devintr()
       uartintr();
     } else if(irq == VIRTIO0_IRQ){
       virtio_disk_intr();
-    } else if(irq){
+    }
+#ifdef LAB_NET
+    else if(irq == E1000_IRQ){
+      e1000_intr();
+    }
+#endif
+    else if(irq){
       printf("unexpected interrupt irq=%d\n", irq);
     }
 
