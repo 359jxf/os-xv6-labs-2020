@@ -128,6 +128,8 @@ found:
   p->context.sp = p->kstack + PGSIZE;
 
   p->ticks=0;
+  p->ticks_cnt=0;
+  p->handler=0;
   p->handler_executing=0;
   return p;
 }
